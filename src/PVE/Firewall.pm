@@ -888,8 +888,8 @@ sub local_network {
 }
 
 # ipset names are limited to 31 characters,
-# and we use '-v4' or '-v6' to indicate IP versions, 
-# and we use '_swap' suffix for atomic update, 
+# and we use '-v4' or '-v6' to indicate IP versions,
+# and we use '_swap' suffix for atomic update,
 # for example PVEFW-${VMID}-${ipset_name}_swap
 
 my $max_iptables_ipset_name_length = 31 - length("PVEFW-") - length("_swap");
@@ -1330,7 +1330,7 @@ sub verify_rule {
     }
 
     if ($rule->{source}) {
-	eval { 
+	eval {
 	    my $source_ipversion = parse_address_list($rule->{source});
 	    &$set_ip_version($source_ipversion);
 	};
@@ -1339,8 +1339,8 @@ sub verify_rule {
     }
 
     if ($rule->{dest}) {
-	eval { 
-	    my $dest_ipversion = parse_address_list($rule->{dest}); 
+	eval {
+	    my $dest_ipversion = parse_address_list($rule->{dest});
 	    &$set_ip_version($dest_ipversion);
 	};
 	&$add_error('dest', $@) if $@;
@@ -1478,6 +1478,12 @@ sub iptables_get_chains {
 	return 1 if $name =~ m/^veth\d+.\d+-(:?IN|OUT)$/; # fixme: dev name is configurable
 
 	return 1 if $name =~ m/^venet0-\d+-(:?IN|OUT)$/;
+
+    return 1 if $name =~ m/^tap\d+i\d+-(:?IN|OUT)-PKTSLIMIT$/;
+
+	return 1 if $name =~ m/^veth\d+.\d+-(:?IN|OUT)-PKTSLIMIT$/; # fixme: dev name is configurable
+
+	return 1 if $name =~ m/^venet0-\d+-(:?IN|OUT)-PKTSLIMIT$/;
 
 	return 1 if $name =~ m/^fwbr\d+(v\d+)?-(:?FW|IN|OUT|IPS)$/;
 	return 1 if $name =~ m/^GROUP-(:?[^\s\-]+)-(:?IN|OUT)$/;
@@ -1865,7 +1871,7 @@ sub ruleset_create_vm_chain {
 
     if (!(defined($options->{dhcp}) && $options->{dhcp} == 0)) {
 	if ($direction eq 'OUT') {
-	    ruleset_generate_rule($ruleset, $chain, $ipversion, 
+	    ruleset_generate_rule($ruleset, $chain, $ipversion,
 				  { action => 'PVEFW-SET-ACCEPT-MARK',
 				    proto => 'udp', sport => 68, dport => 67 });
 	} else {
@@ -1883,6 +1889,14 @@ sub ruleset_create_vm_chain {
 	    ruleset_addrule($ruleset, $chain, "-m set ! --match-set $ipfilter_ipset src -j DROP");
 	}
 	ruleset_addrule($ruleset, $chain, "-j MARK --set-mark 0"); # clear mark
+    }
+
+    if ($options->{pktslimit} && $options->{pktslimit} > 0 && $options->{pktslimit} <= 10000) {
+        my $pktslimit = $options->{pktslimit};
+        ruleset_create_chain($ruleset, "${chain}-PKTSLIMIT");
+        ruleset_addrule($ruleset, "${chain}-PKTSLIMIT", "-m limit --limit ${pktslimit}/s -j RETURN");
+        ruleset_addrule($ruleset, "${chain}-PKTSLIMIT", "-j DROP");
+        ruleset_addrule($ruleset, $chain, "-j ${chain}-PKTSLIMIT");
     }
 }
 
@@ -2028,7 +2042,7 @@ sub generate_tap_rules_direction {
 
     my $ipfilter_name = compute_ipfilter_ipset_name($netid);
     my $ipfilter_ipset = compute_ipset_chain_name($vmid, $ipfilter_name, $ipversion)
-	if $vmfw_conf->{ipset}->{$ipfilter_name};	
+	if $vmfw_conf->{ipset}->{$ipfilter_name};
 
     # create chain with mac and ip filter
     ruleset_create_vm_chain($ruleset, $tapchain, $ipversion, $options, $macaddr, $ipfilter_ipset, $direction);
@@ -2100,7 +2114,7 @@ sub enable_host_firewall {
 	    if ($rule->{type} eq 'group') {
 		ruleset_add_group_rule($ruleset, $cluster_conf, $chain, $rule, 'IN', $accept_action, $ipversion);
 	    } elsif ($rule->{type} eq 'in') {
-		ruleset_generate_rule($ruleset, $chain, $ipversion, $rule, 
+		ruleset_generate_rule($ruleset, $chain, $ipversion, $rule,
 				      { ACCEPT => $accept_action, REJECT => "PVEFW-reject" },
 				      undef, $cluster_conf, $hostfw_conf);
 	    }
@@ -2156,7 +2170,7 @@ sub enable_host_firewall {
 	    if ($rule->{type} eq 'group') {
 		ruleset_add_group_rule($ruleset, $cluster_conf, $chain, $rule, 'OUT', $accept_action, $ipversion);
 	    } elsif ($rule->{type} eq 'out') {
-		ruleset_generate_rule($ruleset, $chain, $ipversion, 
+		ruleset_generate_rule($ruleset, $chain, $ipversion,
 				      $rule, { ACCEPT => $accept_action, REJECT => "PVEFW-reject" },
 				      undef, $cluster_conf, $hostfw_conf);
 	    }
@@ -2203,8 +2217,8 @@ sub generate_group_rules {
     foreach my $rule (@$rules) {
 	next if $rule->{type} ne 'in';
 	next if $rule->{ipversion} && $rule->{ipversion} ne $ipversion;
-	ruleset_generate_rule($ruleset, $chain, $ipversion, $rule, 
-			      { ACCEPT => "PVEFW-SET-ACCEPT-MARK", REJECT => "PVEFW-reject" }, 
+	ruleset_generate_rule($ruleset, $chain, $ipversion, $rule,
+			      { ACCEPT => "PVEFW-SET-ACCEPT-MARK", REJECT => "PVEFW-reject" },
 			      undef, $cluster_conf);
     }
 
@@ -2219,7 +2233,7 @@ sub generate_group_rules {
 	# we use PVEFW-SET-ACCEPT-MARK (Instead of ACCEPT) because we need to
 	# check also other tap rules later
 	ruleset_generate_rule($ruleset, $chain, $ipversion, $rule,
-			      { ACCEPT => 'PVEFW-SET-ACCEPT-MARK', REJECT => "PVEFW-reject" }, 
+			      { ACCEPT => 'PVEFW-SET-ACCEPT-MARK', REJECT => "PVEFW-reject" },
 			      undef, $cluster_conf);
     }
 }
@@ -2316,6 +2330,9 @@ sub parse_vmfw_option {
     if ($line =~ m/^(enable|dhcp|macfilter|ips):\s*(0|1)\s*$/i) {
 	$opt = lc($1);
 	$value = int($2);
+    } elsif ($line =~ m/^(pktslimit):\s*(\d+)\s*$/i) {
+    $opt = lc($1);
+	$value = int($2);
     } elsif ($line =~ m/^(log_level_in|log_level_out):\s*(($loglevels)\s*)?$/i) {
 	$opt = lc($1);
 	$value = $2 ? lc($3) : '';
@@ -2389,7 +2406,7 @@ sub parse_ip_or_cidr {
     my ($cidr) = @_;
 
     my $ipversion;
-    
+
     if ($cidr =~ m!^(?:$IPV6RE)(/(\d+))?$!) {
 	$cidr =~ s|/128$||;
 	$ipversion = 6;
@@ -2467,7 +2484,7 @@ sub generic_fw_config_parser {
 		warn "$prefix: $err";
 		next;
 	    }
-	    
+
 	    $res->{$section}->{$group} = [];
 	    $res->{group_comments}->{$group} =  decode('utf8', $comment)
 		if $comment;
@@ -2483,7 +2500,7 @@ sub generic_fw_config_parser {
 	    $section = 'ipset';
 	    $group = lc($1);
 	    my $comment = $2;
-	    eval {	
+	    eval {
 		die "ipset name too long\n" if length($group) > $max_ipset_name_length;
 		die "invalid ipset name '$group'\n" if $group !~ m/^${ipset_name_pattern}$/;
 	    };
@@ -2552,7 +2569,7 @@ sub generic_fw_config_parser {
 		$errors->{nomatch} = "nomatch not supported by kernel";
 	    }
 
-	    eval { 
+	    eval {
 		if ($cidr =~ m/^${ip_alias_pattern}$/) {
 		    resolve_alias($cluster_conf, $res, $cidr); # make sure alias exists
 		} else {
@@ -2762,7 +2779,7 @@ my $format_aliases = sub {
 
 my $format_ipsets = sub {
     my ($fw_conf) = @_;
-    
+
     my $raw = '';
 
     foreach my $ipset (sort keys %{$fw_conf->{ipset}}) {
@@ -2869,7 +2886,7 @@ sub generate_std_chains {
 	# same as shorewall smurflog.
 	$chain = 'PVEFW-smurflog';
 	$std_chains->{$chain} = [];
-	
+
 	push @{$std_chains->{$chain}}, get_log_rule_base($chain, 0, "DROP: ", $loglevel) if $loglevel;
 	push @{$std_chains->{$chain}}, "-j DROP";
     }
@@ -2994,7 +3011,7 @@ sub save_clusterfw_conf {
     $raw .= &$format_aliases($aliases) if $aliases && scalar(keys %$aliases);
 
     $raw .= &$format_ipsets($cluster_conf) if $cluster_conf->{ipset};
- 
+
     my $rules = $cluster_conf->{rules};
     if ($rules && scalar(@$rules)) {
 	$raw .= "[RULES]\n\n";
@@ -3093,7 +3110,7 @@ sub compile_iptables_filter {
 	my $localnet_ver;
 	($localnet, $localnet_ver) = parse_ip_or_cidr(local_network() || '127.0.0.0/8');
 
-	$cluster_conf->{aliases}->{local_network} = { 
+	$cluster_conf->{aliases}->{local_network} = {
 	    name => 'local_network', cidr => $localnet, ipversion => $localnet_ver };
     }
 
@@ -3550,7 +3567,7 @@ sub remove_pvefw_chains_ipset {
     my $ipset_chains = ipset_get_chains();
 
     my $cmdlist = "";
- 
+
     foreach my $chain (keys %$ipset_chains) {
 	$cmdlist .= "flush $chain\n";
 	$cmdlist .= "destroy $chain\n";
