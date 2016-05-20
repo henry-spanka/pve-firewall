@@ -2000,31 +2000,37 @@ sub generate_venet_rules_direction {
 
     ruleset_create_vm_chain($ruleset, $chain, $ipversion, $options, undef, undef, $direction);
 
-    ruleset_generate_vm_rules($ruleset, $rules, $cluster_conf, $vmfw_conf, $chain, 'venet', $direction, undef, $ipversion);
+    if ($options->{enable}) {
 
-    # implement policy
-    my $policy;
+        ruleset_generate_vm_rules($ruleset, $rules, $cluster_conf, $vmfw_conf, $chain, 'venet', $direction, undef, $ipversion);
 
-    if ($direction eq 'OUT') {
-	$policy = $options->{policy_out} || 'ACCEPT'; # allow everything by default
+        # implement policy
+        my $policy;
+
+        if ($direction eq 'OUT') {
+            $policy = $options->{policy_out} || 'ACCEPT'; # allow everything by default
+        } else {
+            $policy = $options->{policy_in} || 'DROP'; # allow nothing by default
+        }
+
+        my $accept = generate_nfqueue($options);
+        my $accept_action = $direction eq 'OUT' ? "PVEFW-SET-ACCEPT-MARK" : $accept;
+        ruleset_add_chain_policy($ruleset, $chain, $ipversion, $vmid, $policy, $loglevel, $accept_action);
     } else {
-	$policy = $options->{policy_in} || 'DROP'; # allow nothing by default
+        my $accept_action = $direction eq 'OUT' ? "PVEFW-SET-ACCEPT-MARK" : 'ACCEPT';
+        ruleset_add_chain_policy($ruleset, $chain, $ipversion, $vmid, 'ACCEPT', $loglevel, $accept_action);
     }
 
-    my $accept = generate_nfqueue($options);
-    my $accept_action = $direction eq 'OUT' ? "PVEFW-SET-ACCEPT-MARK" : $accept;
-    ruleset_add_chain_policy($ruleset, $chain, $ipversion, $vmid, $policy, $loglevel, $accept_action);
-
     if ($direction eq 'OUT') {
-	ruleset_generate_rule_insert($ruleset, "PVEFW-VENET-OUT", $ipversion, {
-	    action => $chain,
-	    source => $ip,
-	    iface_in => 'venet0'});
+    	ruleset_generate_rule_insert($ruleset, "PVEFW-VENET-OUT", $ipversion, {
+    	    action => $chain,
+    	    source => $ip,
+    	    iface_in => 'venet0'});
     } else {
-	ruleset_generate_rule($ruleset, "PVEFW-VENET-IN", $ipversion, {
-	    action => $chain,
-	    dest => $ip,
-	    iface_out => 'venet0'});
+    	ruleset_generate_rule($ruleset, "PVEFW-VENET-IN", $ipversion, {
+    	    action => $chain,
+    	    dest => $ip,
+    	    iface_out => 'venet0'});
     }
 }
 
@@ -3198,7 +3204,6 @@ sub compile_iptables_filter {
 
 	    generate_ipset_chains($ipset_ruleset, $cluster_conf, $vmfw_conf);
 
-	    if ($vmfw_conf->{options}->{enable}) {
 		if ($conf->{ip_address} && $conf->{ip_address}->{value}) {
 		    my $ip = $conf->{ip_address}->{value};
 		    $ip =~ s/\s+/,/g;
@@ -3217,7 +3222,6 @@ sub compile_iptables_filter {
 			generate_venet_rules_direction($ruleset, $cluster_conf, $vmfw_conf, $vmid, $ip_list, 'OUT', $ipversion);
 		    }
 		}
-	    }
 
 	    if ($conf->{netif} && $conf->{netif}->{value}) {
 		my $netif = PVE::OpenVZ::parse_netif($conf->{netif}->{value});
