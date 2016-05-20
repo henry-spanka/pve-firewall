@@ -3499,7 +3499,7 @@ sub apply_ruleset {
 sub update_nf_conntrack_max {
     my ($hostfw_conf) = @_;
 
-    my $max = 65536; # reasonable default
+    my $max = 196608; # reasonable default
 
     my $options = $hostfw_conf->{options} || {};
 
