@@ -1,3 +1,11 @@
+pve-firewall (1.0-23) unstable; urgency=low
+
+  * limit packets even if firewall is disabled for OpenVZ
+
+  * set nf_conntrack maximum entries to 196608
+
+ -- Henry Spanka - myVirtualserver <henry@myvirtualserver.de>  Fri, 27 May 2016 15:59:09 +0200
+
 pve-firewall (1.0-22) unstable; urgency=low
 
   * limit packets per second for OpenVZ and Qemu
