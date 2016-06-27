@@ -1,3 +1,9 @@
+pve-firewall (1.1-2) unstable; urgency=low
+
+  * fix ebtables-restore when no tap network device exists
+
+ -- Henry Spanka - myVirtualserver <henry@myvirtualserver.de>  Mon, 27 Jun 2016 17:47:38 +0200
+
 pve-firewall (1.1-1) unstable; urgency=low
 
   * Prevent ARP/NDP Spoofing with iptables
