@@ -30,6 +30,8 @@ install: pve-firewall pve-firewall.1 pvefw-logger
 	make -C PVE install
 	install -d -m 0755 ${DESTDIR}/${SBINDIR}
 	install -m 0755 pve-firewall ${DESTDIR}/${SBINDIR}
+	install -m 0755 ebtables-save ${DESTDIR}/${SBINDIR}
+	install -m 0755 ebtables-restore ${DESTDIR}/${SBINDIR}
 	install -m 0755 --strip pvefw-logger ${DESTDIR}/${SBINDIR}
 	install -d ${MAN1DIR}
 	install -m 0644 pve-firewall.1 ${MAN1DIR}

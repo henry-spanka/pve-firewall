@@ -1460,6 +1460,12 @@ sub ipset_restore_cmdlist {
     run_command("/usr/sbin/ipset restore", input => $cmdlist, errmsg => "ipset_restore_cmdlist");
 }
 
+sub ebtables_restore_cmdlist {
+    my ($cmdlist) = @_;
+
+    run_command("/usr/sbin/ebtables-restore", input => $cmdlist);
+}
+
 sub iptables_get_chains {
     my ($iptablescmd) = @_;
 
@@ -1527,6 +1533,44 @@ sub iptables_get_chains {
     run_command("/sbin/$iptablescmd-save", outfunc => $parser);
 
     return wantarray ? ($res, $hooks) : $res;
+}
+
+sub ebtables_get_chains {
+
+    my $res = {};
+    my $chains = {};
+
+    my $parser = sub {
+    	my $line = shift;
+    	return if $line =~ m/^#/;
+    	return if $line =~ m/^\s*$/;
+    	if ($line =~ m/^(?:\S+)\s(EB-PVEFW-\S+)\s(?:\S+).*/) {
+    	    my $chain = $1;
+    	    $line =~ s/\s+$//;
+    	    push @{$chains->{$chain}}, $line;
+    	} elsif ($line =~ m/^(?:\S+)\s(EB-tap\d+i\d+-(:?IN|OUT))\s(?:\S+).*/) {
+    	    my $chain = $1;
+    	    $line =~ s/\s+$//;
+    	    push @{$chains->{$chain}}, $line;
+    	} elsif ($line =~ m/^(?:\S+)\s(EB-veth\d+.\d+-(:?IN|OUT))\s(?:\S+).*/) {
+    	    my $chain = $1;
+    	    $line =~ s/\s+$//;
+    	    push @{$chains->{$chain}}, $line;
+
+    	} else {;
+    	    # simply ignore the rest
+    	    return;
+    	}
+    };
+
+    run_command("/usr/sbin/ebtables-save", outfunc => $parser);
+
+    # compute digest for each chain
+    foreach my $chain (keys %$chains) {
+       $res->{$chain} = iptables_chain_digest($chains->{$chain});
+    }
+
+    return $res;
 }
 
 sub iptables_chain_digest {
@@ -3099,8 +3143,9 @@ sub compile {
 
     my ($ruleset, $ipset_ruleset) = compile_iptables_filter($cluster_conf, $hostfw_conf, $vmfw_configs, $vmdata, 4, $verbose);
     my ($rulesetv6) = compile_iptables_filter($cluster_conf, $hostfw_conf, $vmfw_configs, $vmdata, 6, $verbose);
+    my ($ebtables_ruleset) = compile_ebtables_filter($cluster_conf, $hostfw_conf, $vmfw_configs, $vmdata, $verbose);
 
-    return ($ruleset, $ipset_ruleset, $rulesetv6);
+    return ($ruleset, $ipset_ruleset, $rulesetv6, $ebtables_ruleset);
 }
 
 sub compile_iptables_filter {
@@ -3250,10 +3295,159 @@ sub compile_iptables_filter {
     return ($ruleset, $ipset_ruleset);
 }
 
+sub compile_ebtables_filter {
+    my ($cluster_conf, $hostfw_conf, $vmfw_configs, $vmdata, $verbose) = @_;
+
+    return ({}, {}) if !$cluster_conf->{options}->{enable};
+
+    my $ruleset = {};
+
+    ruleset_create_chain($ruleset, "EB-PVEFW-FORWARD");
+
+
+    ruleset_create_chain($ruleset, "EB-PVEFW-FWBR-IN");
+    ruleset_create_chain($ruleset, "EB-PVEFW-FWBR-OUT");
+
+    ruleset_addrule($ruleset, "EB-PVEFW-FORWARD", "-i fwln+ -j EB-PVEFW-FWBR-IN");
+    ruleset_addrule($ruleset, "EB-PVEFW-FORWARD", "-o fwln+ -j EB-PVEFW-FWBR-OUT");
+
+    # generate firewall rules for QEMU VMs
+    foreach my $vmid (keys %{$vmdata->{qemu}}) {
+    	eval {
+    	    my $conf = $vmdata->{qemu}->{$vmid};
+    	    my $vmfw_conf = $vmfw_configs->{$vmid};
+    	    return if !$vmfw_conf;
+
+    	    foreach my $netid (keys %$conf) {
+    		next if $netid !~ m/^net(\d+)$/;
+    		my $net = PVE::QemuServer::parse_net($conf->{$netid});
+    		next if !$net->{firewall};
+    		my $iface = "tap${vmid}i$1";
+    		my $macaddr = $net->{macaddr};
+
+            # ebtables remove preceeding zero so we need to do it too
+            my @newmacpartials = ();
+
+            foreach my $macpartial (split(/:/, $macaddr)) {
+                $macpartial =~ s/^0//;
+                push @newmacpartials, $macpartial;
+            }
+
+            $macaddr = join(":", @newmacpartials);
+
+    		generate_tap_layer2filter($ruleset, $iface, $macaddr, $vmfw_conf, $vmid, $netid);
+
+    	    }
+    	};
+    	warn $@ if $@; # just to be sure - should not happen
+    }
+
+    # generate firewall rules for OpenVZ containers
+    foreach my $vmid (keys %{$vmdata->{openvz}}) {
+    	eval {
+    	    my $conf = $vmdata->{openvz}->{$vmid};
+
+    	    my $vmfw_conf = $vmfw_configs->{$vmid};
+    	    return if !$vmfw_conf;
+
+    	    if ($conf->{netif} && $conf->{netif}->{value}) {
+        		my $netif = PVE::OpenVZ::parse_netif($conf->{netif}->{value});
+        		foreach my $netid (keys %$netif) {
+        		    my $d = $netif->{$netid};
+        		    my $bridge = $d->{bridge};
+        		    next if !$bridge || $bridge !~ m/^vmbr\d+(v(\d+))?f$/; # firewall enabled ?
+        		    my $macaddr = $d->{mac};
+        		    my $iface = $d->{host_ifname};
+
+        		    # ebtables remove preceeding zero so we need todo it too (but only the first)
+        		    $macaddr =~ s/^0//;
+
+        		    generate_tap_layer2filter($ruleset, $iface, $macaddr, $vmfw_conf, $vmid, $netid);
+        		}
+    	    }
+    	};
+    	warn $@ if $@; # just to be sure - should not happen
+    }
+
+    return $ruleset;
+}
+
+sub generate_tap_layer2filter {
+    my ($ruleset, $iface, $macaddr, $vmfw_conf, $vmid, $netid) = @_;
+    my $options = $vmfw_conf->{options};
+
+    my $tapchainin = "EB-${iface}-IN";
+    my $tapchainout = "EB-${iface}-OUT";
+    $macaddr = lc($macaddr);
+
+    ruleset_create_chain($ruleset, $tapchainin);
+    ruleset_create_chain($ruleset, $tapchainout);
+
+    ruleset_addrule($ruleset, $tapchainin, "-p IPv4 -d ${macaddr} -j ACCEPT");
+    ruleset_addrule($ruleset, $tapchainin, "-p ARP --arp-mac-dst ${macaddr} -j ACCEPT");
+    ruleset_addrule($ruleset, $tapchainin, "-p IPv6 -d ${macaddr} -j ACCEPT");
+
+    ruleset_addrule($ruleset, $tapchainin, "-p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type neighbour-advertisement -j ACCEPT");
+    ruleset_addrule($ruleset, $tapchainin, "-p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type router-advertisement -j ACCEPT");
+    #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type neighbour-solicitation -j ACCEPT");
+    #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type router-solicitation -j ACCEPT");
+    ruleset_addrule($ruleset, $tapchainin, "-p IPv6 --ip6-dst fe80::/ffc0:: -j ACCEPT");
+    #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 --ip6-src fe80::/10 -j ACCEPT");
+    ruleset_addrule($ruleset, $tapchainin, "-p IPv6 --ip6-dst ff00::/ff00:: -j ACCEPT");
+    #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 --ip6-src ff00::/8 -j ACCEPT");
+
+    ruleset_addrule($ruleset, $tapchainout, "-p IPv6 -s ${macaddr} -j ACCEPT");
+
+    if (defined($macaddr) && !(defined($options->{macfilter}) && $options->{macfilter} == 0)) {
+
+        my $ipfilter_name = compute_ipfilter_ipset_name($netid);
+
+    	if ($vmfw_conf->{ipset}->{$ipfilter_name}) {
+            foreach my $ipfilter (@{$vmfw_conf->{ipset}->{$ipfilter_name}}) {
+                if ($ipfilter->{cidr}) {
+                    my $cidr = $ipfilter->{cidr};
+                    my $ipobj = new Net::IP($cidr);
+                    my $ipversion = Net::IP::ip_get_version($ipobj->ip());
+
+                    if ($ipversion eq 6) {
+                        my $mask = Net::IP::ip_compress_address($ipobj->mask(), $ipversion);
+                        my $ip = Net::IP::ip_compress_address($ipobj->ip(), $ipversion);
+                        #if (defined($ipfilter->{nomatch}) && $ipfilter->{nomatch}) {
+                            #ruleset_addrule($ruleset, $tapchainin, "-p IPv6 --ip6-dst ! ${ip}/${mask} -j ACCEPT");
+                            #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 -s ${macaddr} --ip6-src ! ${ip}/${mask} -j ACCEPT");
+                        #} else {
+                            #ruleset_addrule($ruleset, $tapchainin, "-p IPv6 --ip6-dst ${ip}/${mask} -j ACCEPT");
+                            #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 -s ${macaddr} --ip6-src ${ip}/${mask} -j ACCEPT");
+                            #ruleset_addrule($ruleset, $tapchainout, "-p IPv6 --ip6-src ${ip}/${mask} -j ACCEPT");
+                        #}
+                    } else {
+                        if (defined($ipfilter->{nomatch}) && $ipfilter->{nomatch}) {
+                            ruleset_addrule($ruleset, $tapchainin, "-p IPv4 --ip-dst ! ${cidr} -j ACCEPT");
+                            ruleset_addrule($ruleset, $tapchainin, "-p ARP --arp-ip-dst ! ${cidr} -j ACCEPT");
+                            ruleset_addrule($ruleset, $tapchainout, "-p IPv4 -s ${macaddr} --ip-src ! ${cidr} -j ACCEPT");
+                            ruleset_addrule($ruleset, $tapchainout, "-p ARP --arp-ip-src ! ${cidr} --arp-mac-src ${macaddr} -j ACCEPT");
+                        } else {
+                            ruleset_addrule($ruleset, $tapchainin, "-p IPv4 --ip-dst ${cidr} -j ACCEPT");
+                            ruleset_addrule($ruleset, $tapchainin, "-p ARP --arp-ip-dst ${cidr} -j ACCEPT");
+                            ruleset_addrule($ruleset, $tapchainout, "-p IPv4 -s ${macaddr} --ip-src ${cidr} -j ACCEPT");
+                            ruleset_addrule($ruleset, $tapchainout, "-p ARP --arp-ip-src ${cidr} --arp-mac-src ${macaddr} -j ACCEPT");
+                        }
+                    }
+                }
+            }
+            ruleset_addrule($ruleset, $tapchainin, "-j DROP");
+            ruleset_addrule($ruleset, $tapchainout, "-j DROP");
+        }
+    }
+    ruleset_addrule($ruleset, "EB-PVEFW-FWBR-IN","-o $iface -j $tapchainin");
+    ruleset_addrule($ruleset, "EB-PVEFW-FWBR-OUT","-i $iface -j $tapchainout");
+}
+
 sub get_ruleset_status {
     my ($ruleset, $active_chains, $digest_fn, $verbose) = @_;
 
     my $statushash = {};
+
 
     foreach my $chain (sort keys %$ruleset) {
 	my $sig = &$digest_fn($ruleset->{$chain});
@@ -3357,6 +3551,42 @@ sub get_ruleset_cmdlist {
     return wantarray ? ($cmdlist, $changes) : $cmdlist;
 }
 
+sub get_ebtables_cmdlist {
+    my ($ruleset, $verbose) = @_;
+
+    my $changes = 0;
+    my $cmdlist = "*filter\n";
+
+    my ($active_chains, $hooks) = ebtables_get_chains();
+    my $statushash = get_ruleset_status($ruleset, $active_chains, \&iptables_chain_digest, $verbose);
+
+    # create chains first
+    foreach my $chain (sort keys %$ruleset) {
+        my $stat = $statushash->{$chain};
+        die "internal error" if !$stat;
+    	$cmdlist .= ":$chain ACCEPT\n";
+    }
+
+    foreach my $h (qw(FORWARD)) {
+       my $chain = "EB-PVEFW-$h";
+    	if ($ruleset->{$chain}) {
+    	    $cmdlist .= "-A $h -j $chain\n";
+    	}
+    }
+
+    foreach my $chain (sort keys %$ruleset) {
+    	my $stat = $statushash->{$chain};
+    	die "internal error" if !$stat;
+    	$changes = 1 if ($stat->{action} ne 'exists');
+
+    	foreach my $cmd (@{$ruleset->{$chain}}) {
+            $cmdlist .= "$cmd\n";
+    	}
+    }
+
+    return wantarray ? ($cmdlist, $changes) : $cmdlist;
+}
+
 sub get_ipset_cmdlist {
     my ($ruleset, $verbose) = @_;
 
@@ -3416,7 +3646,7 @@ sub get_ipset_cmdlist {
 }
 
 sub apply_ruleset {
-    my ($ruleset, $hostfw_conf, $ipset_ruleset, $rulesetv6, $verbose) = @_;
+    my ($ruleset, $hostfw_conf, $ipset_ruleset, $rulesetv6, $ebtables_ruleset, $verbose) = @_;
 
     enable_bridge_firewall();
 
@@ -3425,6 +3655,7 @@ sub apply_ruleset {
 
     my ($cmdlist, $changes) = get_ruleset_cmdlist($ruleset, $verbose);
     my ($cmdlistv6, $changesv6) = get_ruleset_cmdlist($rulesetv6, $verbose, "ip6tables");
+    my ($ebtables_cmdlist, $ebtables_changes) = get_ebtables_cmdlist($ebtables_ruleset, $verbose);
 
     if ($verbose) {
 	if ($ipset_changes) {
@@ -3442,6 +3673,11 @@ sub apply_ruleset {
 	    print "ip6tables changes:\n";
 	    print $cmdlistv6;
 	}
+
+    if ($ebtables_changes) {
+    	print "ebtables changes:\n";
+    	print $ebtables_cmdlist;
+    }
     }
 
     my $tmpfile = "$pve_fw_status_dir/ipsetcmdlist1";
@@ -3463,6 +3699,8 @@ sub apply_ruleset {
     PVE::Tools::file_set_contents($tmpfile, $ipset_delete_cmdlist || '');
 
     ipset_restore_cmdlist($ipset_delete_cmdlist) if $ipset_delete_cmdlist;
+
+    ebtables_restore_cmdlist($ebtables_cmdlist);
 
     # test: re-read status and check if everything is up to date
     my $active_chains = iptables_get_chains();
@@ -3486,6 +3724,17 @@ sub apply_ruleset {
 	    warn "unable to update chain '$chain'\n";
 	    $errors = 1;
 	}
+    }
+
+    my $active_ebtables_chains = ebtables_get_chains();
+    my $ebtables_statushash = get_ruleset_status($ebtables_ruleset, $active_ebtables_chains, \&iptables_chain_digest, 0);
+
+    foreach my $chain (sort keys %$ebtables_ruleset) {
+        my $stat = $ebtables_statushash->{$chain};
+    	if ($stat->{action} ne 'exists') {
+    	    warn "ebtables : unable to update chain '$chain'\n";
+    	    $errors = 1;
+    	}
     }
 
     die "unable to apply firewall changes\n" if $errors;
@@ -3534,6 +3783,7 @@ sub remove_pvefw_chains {
 
     PVE::Firewall::remove_pvefw_chains_iptables("iptables");
     PVE::Firewall::remove_pvefw_chains_iptables("ip6tables");
+    PVE::Firewall::remove_pvefw_chains_ebtables();
     PVE::Firewall::remove_pvefw_chains_ipset();
 
 }
@@ -3564,6 +3814,29 @@ sub remove_pvefw_chains_iptables {
     } else {
 	iptables_restore_cmdlist($cmdlist);
     }
+}
+
+sub remove_pvefw_chains_ebtables {
+
+    #my ($chash, $hooks) = ebtables_get_chains();
+    #my $cmdlist = "*filter\n";
+
+    #foreach my $h (qw(FORWARD)) {
+    	#if ($hooks->{$h}) {
+    	    #$cmdlist .= "-D $h -j EB-PVEFW-$h\n";
+    	#}
+    #}
+
+    #foreach my $chain (keys %$chash) {
+	       #$cmdlist .= "-F $chain\n";
+    #}
+
+    #foreach my $chain (keys %$chash) {
+	       #$cmdlist .= "-X $chain\n";
+    #}
+
+	#ebtables_restore_cmdlist($cmdlist);
+    PVE::Tools::run_command("ebtables --init-table");
 }
 
 sub remove_pvefw_chains_ipset {
@@ -3603,9 +3876,9 @@ sub update {
 
 	my $hostfw_conf = load_hostfw_conf($cluster_conf);
 
-	my ($ruleset, $ipset_ruleset, $rulesetv6) = compile($cluster_conf, $hostfw_conf);
+	my ($ruleset, $ipset_ruleset, $rulesetv6, $ebtables_ruleset) = compile($cluster_conf, $hostfw_conf);
 
-	apply_ruleset($ruleset, $hostfw_conf, $ipset_ruleset, $rulesetv6);
+    apply_ruleset($ruleset, $hostfw_conf, $ipset_ruleset, $rulesetv6, $ebtables_ruleset);
     };
 
     run_locked($code);

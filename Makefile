@@ -33,7 +33,7 @@ deb ${DEB}: check
 	echo "git clone git://git.proxmox.com/git/pve-firewall.git\\ngit checkout ${GITVERSION}" > build/debian/SOURCE
 	# install
 	cd build; dpkg-buildpackage -rfakeroot -b -us -uc
-	lintian ${DEB}
+	lintian -X binaries ${DEB}
 
 .PHONY: check
 check: 
